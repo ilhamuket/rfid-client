@@ -2,5 +2,9 @@
   "port": "COM15",
   "baudrate": 115200,
   "endpoint": "http://localhost:8000/api/rfid",
-  "checkpoint": "START"
+  "device_key": "inikeynya",
+  "event_id": 1,
+  "checkpoint_type": "start",
+  "debounce_ms": 3000,
+  "retry_queue_max": 200
 }
