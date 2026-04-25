@@ -1,7 +1,7 @@
 {
   "port": "COM15",
   "baudrate": 115200,
-  "endpoint": "http://localhost:8000/api/rfid",
+  "endpoint": "https://scoutrun.id/api/rfid",
   "device_key": "inikeynya",
   "event_id": 1,
   "checkpoint_type": "start",
