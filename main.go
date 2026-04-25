@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -20,9 +18,10 @@ type Config struct {
 	BaudRate int    `json:"baudrate"`
 }
 
-type TagProfile struct {
+type Runner struct {
+	Bib   string
 	Name  string
-	Signs map[string]int
+	Signs []string
 }
 
 func loadConfig() Config {
@@ -37,14 +36,25 @@ func loadConfig() Config {
 	return c
 }
 
+// SAMPLE DATABASE
+var runners = []Runner{
+	{"101", "Peserta A", []string{"9E6660000066607E"}},
+	{"102", "Peserta B", []string{"9E666000006618FE"}},
+	{"103", "Peserta C", []string{"9E66600000661886", "98187E1880601880"}},
+	{"104", "Peserta D", []string{"9E66600000061878", "98187E188060187E"}},
+	{"105", "Peserta E", []string{"66600000666098FE"}},
+}
+
 func main() {
 	cfg := loadConfig()
 
-	fmt.Println("=== RFID TRAINER FINAL V3 ===")
-	fmt.Println("5 Tag x 10 Scan")
+	fmt.Println("=== RFID RACE SCANNER ===")
+	fmt.Println("ACTIVE MODE")
 	fmt.Println()
 
-	mode := &serial.Mode{BaudRate: cfg.BaudRate}
+	mode := &serial.Mode{
+		BaudRate: cfg.BaudRate,
+	}
 
 	port, err := serial.Open(cfg.Port, mode)
 	if err != nil {
@@ -54,114 +64,74 @@ func main() {
 
 	fmt.Println("CONNECTED ✅")
 
-	reader := bufio.NewReader(os.Stdin)
-
 	buf := make([]byte, 256)
 	var acc []byte
 
-	for tag := 1; tag <= 5; tag++ {
+	lastSeen := map[string]time.Time{}
 
-		fmt.Printf("\n=============================\n")
-		fmt.Printf("SIAPKAN TAG-%d\n", tag)
-		fmt.Println("Pastikan tag lain jauh dari reader.")
-		fmt.Println("Tekan ENTER jika siap.")
-		reader.ReadString('\n')
-
-		acc = nil
-		flush(port)
-
-		fmt.Println("Mulai dalam:")
-		for i := 3; i >= 1; i-- {
-			fmt.Println(i)
-			time.Sleep(1 * time.Second)
+	for {
+		n, err := port.Read(buf)
+		if err != nil {
+			log.Fatal(err)
 		}
 
-		fmt.Printf("TEMPELKAN TAG-%d SEKARANG\n\n", tag)
-
-		profile := TagProfile{
-			Name:  fmt.Sprintf("TAG-%d", tag),
-			Signs: map[string]int{},
+		if n == 0 {
+			continue
 		}
 
-		total := 0
-		lastSig := ""
-		lastTime := time.Time{}
+		acc = append(acc, buf[:n]...)
 
-		timeout := time.Now().Add(30 * time.Second)
-
-		for total < 10 {
-
-			if time.Now().After(timeout) {
-				fmt.Println("Timeout scan.")
+		for {
+			sof := bytes.IndexByte(acc, 0xE0)
+			if sof < 0 {
+				acc = nil
 				break
 			}
 
-			n, err := port.Read(buf)
-			if err != nil {
-				log.Fatal(err)
+			acc = acc[sof:]
+
+			if len(acc) < 2 {
+				break
 			}
 
-			if n == 0 {
+			next := bytes.IndexByte(acc[1:], 0xE0)
+			if next < 0 {
+				break
+			}
+
+			frame := acc[1 : next+1]
+			acc = acc[next+1:]
+
+			raw := strings.ToUpper(hex.EncodeToString(frame))
+			sig := getSignature(raw)
+
+			runner, found := findRunner(sig)
+			if !found {
+				fmt.Printf("[%s] UNKNOWN %s\n",
+					now(),
+					sig,
+				)
 				continue
 			}
 
-			acc = append(acc, buf[:n]...)
-
-			for {
-				sof := bytes.IndexByte(acc, 0xE0)
-				if sof < 0 {
-					acc = nil
-					break
-				}
-
-				acc = acc[sof:]
-
-				if len(acc) < 2 {
-					break
-				}
-
-				next := bytes.IndexByte(acc[1:], 0xE0)
-				if next < 0 {
-					break
-				}
-
-				frame := acc[1 : next+1]
-				acc = acc[next+1:]
-
-				raw := strings.ToUpper(hex.EncodeToString(frame))
-				sig := getSignature(raw)
-
-				// debounce by time
-				if sig == lastSig && time.Since(lastTime) < 350*time.Millisecond {
+			// anti duplicate 3 detik
+			if t, ok := lastSeen[runner.Bib]; ok {
+				if time.Since(t) < 3*time.Second {
 					continue
 				}
-
-				lastSig = sig
-				lastTime = time.Now()
-
-				total++
-				profile.Signs[sig]++
-
-				fmt.Printf("[%d/10] %s\n", total, sig)
-
-				timeout = time.Now().Add(30 * time.Second)
-
-				if total >= 10 {
-					break
-				}
 			}
+
+			lastSeen[runner.Bib] = time.Now()
+
+			fmt.Printf("[%s] BIB:%s | %s | %s\n",
+				now(),
+				runner.Bib,
+				runner.Name,
+				sig,
+			)
+
+			// TODO kirim ke Laravel API
 		}
-
-		printResult(profile)
-	}
-}
-
-func flush(port serial.Port) {
-	tmp := make([]byte, 256)
-	until := time.Now().Add(2 * time.Second)
-
-	for time.Now().Before(until) {
-		port.Read(tmp)
 	}
 }
 
@@ -172,48 +142,17 @@ func getSignature(raw string) string {
 	return raw[len(raw)-16:]
 }
 
-func printResult(p TagProfile) {
-
-	fmt.Println()
-	fmt.Printf("%s RESULT:\n", p.Name)
-
-	keys := sortMap(p.Signs)
-
-	for _, k := range keys {
-		fmt.Printf("%s => %dx\n", k, p.Signs[k])
+func findRunner(sig string) (Runner, bool) {
+	for _, r := range runners {
+		for _, s := range r.Signs {
+			if s == sig {
+				return r, true
+			}
+		}
 	}
-
-	fmt.Println("-----------------------------")
-	fmt.Printf("%s FINAL TOP SIGNATURES:\n", p.Name)
-
-	for i := 0; i < len(keys) && i < 3; i++ {
-		fmt.Println(keys[i])
-	}
-
-	fmt.Println("-----------------------------")
+	return Runner{}, false
 }
 
-func sortMap(m map[string]int) []string {
-	type pair struct {
-		Key string
-		Val int
-	}
-
-	var arr []pair
-
-	for k, v := range m {
-		arr = append(arr, pair{k, v})
-	}
-
-	sort.Slice(arr, func(i, j int) bool {
-		return arr[i].Val > arr[j].Val
-	})
-
-	var out []string
-
-	for _, x := range arr {
-		out = append(out, x.Key)
-	}
-
-	return out
+func now() string {
+	return time.Now().Format("15:04:05")
 }
