@@ -23,12 +23,12 @@ echo ╔════════════════════════
 echo ║        RFID RACE SCANNER SETUP       ║
 echo ╚══════════════════════════════════════╝
 echo.
-echo  [1] PRODUCTION  (https://event-run.com/api/rfid)
+echo  [1] PRODUCTION  (https://scoutrun.id/api/rfid)
 echo  [2] LOCAL DEV   (http://localhost:8000/api/rfid)
 echo.
 set /p envChoice=" Pilih environment (1/2): "
 
-if "%envChoice%"=="1" set endpoint=https://event-run.com/api/rfid
+if "%envChoice%"=="1" set endpoint=https://scoutrun.id/api/rfid
 if "%envChoice%"=="2" set endpoint=http://localhost:8000/api/rfid
 if not defined endpoint goto ask_env
 
@@ -41,13 +41,11 @@ echo ╚════════════════════════
 echo.
 echo  Pilih Event:
 echo.
-echo  [1] Bandung Night Run 2025    (ID: 1)
-echo  [2] Jakarta Marathon 2025     (ID: 2)
-echo  [3] Bali Ultra Trail 2025     (ID: 3)
+echo  [1] Scout Run 2026    (ID: 1)
 echo.
 set /p eventChoice=" Pilih event (1/2/3): "
 
-if "%eventChoice%"=="1" ( set event_id=1 & set event_name=Scoutrun 2026 )
+if "%eventChoice%"=="1" ( set event_id=1 & set event_name=Scout Run 2026 )
 
 if not defined event_id goto ask_event
 
