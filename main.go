@@ -83,7 +83,7 @@ type ScanPayload struct {
 	ScannedAt      string `json:"scanned_at"`
 }
 
-// ─── RETRY QUEUE (thread-safe) ────────────────────────────────────────────────
+// ─── RETRY QUEUE ──────────────────────────────────────────────────────────────
 
 type RetryQueue struct {
 	mu    sync.Mutex
@@ -94,7 +94,6 @@ type RetryQueue struct {
 func (q *RetryQueue) Push(p ScanPayload) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
 	if len(q.items) >= q.max {
 		q.items = q.items[1:]
 		fmt.Printf("%s %s⚠  Queue penuh (max %d) — scan terlama di-drop%s\n",
@@ -106,7 +105,6 @@ func (q *RetryQueue) Push(p ScanPayload) {
 func (q *RetryQueue) Pop() (ScanPayload, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
 	if len(q.items) == 0 {
 		return ScanPayload{}, false
 	}
@@ -122,15 +120,12 @@ func (q *RetryQueue) Len() int {
 }
 
 // ─── SERVER STATE ─────────────────────────────────────────────────────────────
-// Lacak apakah server sedang reachable atau tidak.
-// Kalau serverDown == 1, scan baru langsung masuk queue tanpa coba kirim.
-// Reset ke 0 saat drain berhasil kirim minimal satu item.
 
 type ServerState struct {
-	down         atomic.Int32  // 0 = up, 1 = down
-	draining     atomic.Int32  // 0 = idle, 1 = sedang drain
-	downSince    time.Time
-	mu           sync.Mutex
+	down      atomic.Int32
+	draining  atomic.Int32
+	downSince time.Time
+	mu        sync.Mutex
 }
 
 func (s *ServerState) MarkDown() {
@@ -153,7 +148,7 @@ func (s *ServerState) MarkUp() {
 	}
 }
 
-func (s *ServerState) IsDown() bool  { return s.down.Load() == 1 }
+func (s *ServerState) IsDown() bool    { return s.down.Load() == 1 }
 func (s *ServerState) IsDraining() bool { return s.draining.Load() == 1 }
 func (s *ServerState) StartDrain() bool { return s.draining.CompareAndSwap(0, 1) }
 func (s *ServerState) StopDrain()       { s.draining.Store(0) }
@@ -197,21 +192,15 @@ func main() {
 	fmt.Printf("%s %s✅ Serial port %s terhubung%s\n\n", ts(), colorGreen, cfg.Port, colorReset)
 
 	// ── Background drain goroutine ─────────────────────────────────────────
-	// Drain jalan sendiri, tidak blocking scanner.
-	// Coba drain setiap 10 detik kalau queue tidak kosong.
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
-
 			if queue.Len() == 0 {
 				continue
 			}
-
-			// Jangan mulai drain kedua kalau yang pertama masih jalan
 			if !server.StartDrain() {
 				continue
 			}
-
 			drainQueue(queue, server, cfg)
 			server.StopDrain()
 		}
@@ -233,35 +222,29 @@ func main() {
 
 		acc = append(acc, buf[:n]...)
 
-		for {
-			sof := bytes.IndexByte(acc, 0xE0)
-			if sof < 0 {
-				acc = nil
-				break
+		// Batasi accumulator supaya tidak tumbuh tak terbatas
+		if len(acc) > 1024 {
+			acc = acc[len(acc)-512:]
+		}
+
+		// Extract semua EPC dari accumulator
+		raw := strings.ToUpper(hex.EncodeToString(acc))
+		tags := extractAllTags(raw)
+
+		if len(tags) == 0 {
+			// Tidak ada EPC ditemukan, simpan sisa untuk frame berikutnya.
+			// Kalau sudah terlalu panjang tanpa hasil, buang.
+			if len(acc) > 128 {
+				acc = acc[len(acc)-32:]
 			}
-			acc = acc[sof:]
-			if len(acc) < 2 {
-				break
-			}
+			continue
+		}
 
-			next := bytes.IndexByte(acc[1:], 0xE0)
-			if next < 0 {
-				break
-			}
+		// Setelah dapat tag, reset accumulator
+		acc = nil
 
-			frame := acc[1 : next+1]
-			acc = acc[next+1:]
-
-			raw := strings.ToUpper(hex.EncodeToString(frame))
-			rfidTag := extractTag(raw)
-
-			if rfidTag == "" {
-				fmt.Printf("%s %sdebug: frame kosong, raw=%s%s\n", ts(), colorGray, raw, colorReset)
-				continue
-			}
-
-			// Log SEBELUM debounce check — untuk tahu tag apa yang dibaca hardware
-			fmt.Printf("%s %sdebug: raw frame → tag=%s%s\n", ts(), colorGray, rfidTag, colorReset)
+		for _, rfidTag := range tags {
+			fmt.Printf("%s %sdebug: tag ditemukan → %s%s\n", ts(), colorGray, rfidTag, colorReset)
 
 			// ── Local debounce ─────────────────────────────────────────────
 			debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
@@ -277,14 +260,12 @@ func main() {
 			}
 			lastSeen[rfidTag] = time.Now()
 
-			scannedAt := time.Now().Format("2006-01-02 15:04:05")
-
 			payload := ScanPayload{
 				EventID:        cfg.EventID,
 				CheckpointType: cfg.CheckpointType,
 				RfidTag:        rfidTag,
 				ReaderID:       readerID,
-				ScannedAt:      scannedAt,
+				ScannedAt:      time.Now().Format("2006-01-02 15:04:05"),
 			}
 
 			fmt.Printf("%s %s📡 SCAN%s  %s%s%s\n",
@@ -292,8 +273,6 @@ func main() {
 				colorBold, rfidTag, colorReset,
 			)
 
-			// ── Kalau server diketahui down, langsung queue ────────────────
-			// Tidak perlu buang waktu 5 detik timeout.
 			if server.IsDown() {
 				queue.Push(payload)
 				fmt.Printf("%s %s📥 QUEUE (server down)%s  %s  → antrian: %d item\n",
@@ -301,9 +280,7 @@ func main() {
 				continue
 			}
 
-			// ── Kirim langsung ─────────────────────────────────────────────
 			result := sendScan(payload, cfg, false)
-
 			switch result {
 			case SendRetry:
 				server.MarkDown()
@@ -311,13 +288,46 @@ func main() {
 				fmt.Printf("%s %s📥 QUEUE%s  %s  → antrian: %d item\n",
 					ts(), colorYellow, colorReset, rfidTag, queue.Len())
 			case SendOK:
-				// Kalau sebelumnya down dan sekarang bisa kirim, mark up
 				if server.IsDown() {
 					server.MarkUp()
 				}
 			}
 		}
 	}
+}
+
+// ─── TAG EXTRACTION ───────────────────────────────────────────────────────────
+// Frame dari reader ini: header beberapa byte, lalu 3000 + EPC(12 byte) berulang.
+// Kita cari semua EPC prefix E280/E200/E007, ambil 24 hex char (12 byte) dari sana.
+// Deduplikasi dalam satu frame untuk menghindari double-count.
+
+var epcPrefixes = []string{"E280", "E200", "E007"}
+
+func extractAllTags(raw string) []string {
+	seen := map[string]bool{}
+	var result []string
+
+	for _, prefix := range epcPrefixes {
+		idx := 0
+		for {
+			pos := strings.Index(raw[idx:], prefix)
+			if pos < 0 {
+				break
+			}
+			abs := idx + pos
+			end := abs + 24
+			if end > len(raw) {
+				break
+			}
+			tag := raw[abs:end]
+			if !seen[tag] {
+				seen[tag] = true
+				result = append(result, tag)
+			}
+			idx = abs + 1
+		}
+	}
+	return result
 }
 
 // ─── SEND SCAN ────────────────────────────────────────────────────────────────
@@ -336,7 +346,6 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 	req.Header.Set("X-DEVICE-KEY", cfg.DeviceKey)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-
 	start := time.Now()
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
@@ -361,85 +370,78 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 
 	switch resp.StatusCode {
 	case 200:
-    success, _ := result["success"].(bool)
+		success, _ := result["success"].(bool)
+		if success {
+			participant, hasParticipant := result["participant"].(map[string]interface{})
+			timing, hasTiming           := result["timing"].(map[string]interface{})
+			checkpoint, _               := result["checkpoint"].(map[string]interface{})
 
-    if success {
-        // Cek apakah response punya data participant (sync) atau hanya acknowledgement (queue)
-        participant, hasParticipant := result["participant"].(map[string]interface{})
-        timing, hasTiming           := result["timing"].(map[string]interface{})
-        checkpoint, _               := result["checkpoint"].(map[string]interface{})
+			if hasParticipant && hasTiming {
+				bib, _      := participant["bib"]
+				name, _     := participant["name"]
+				elapsed, _  := timing["elapsed"]
+				pos, _      := timing["position"]
+				cpName, _   := checkpoint["name"]
+				isFinish, _ := result["is_finish"].(bool)
+				rawLogId, _ := result["raw_log_id"]
 
-        if hasParticipant && hasTiming {
-            // Response lengkap — sync processing (atau job selesai sangat cepat)
-            bib, _      := participant["bib"]
-            name, _     := participant["name"]
-            elapsed, _  := timing["elapsed"]
-            pos, _      := timing["position"]
-            cpName, _   := checkpoint["name"]
-            isFinish, _ := result["is_finish"].(bool)
-            rawLogId, _ := result["raw_log_id"]
+				if isFinish {
+					fmt.Printf("%s %s%s🏁 FINISH!%s  BIB %-5v  %-20v  %v  pos #%v  raw#%v  %s[%dms]%s\n",
+						ts(), retryMark, colorBold+colorGreen, colorReset,
+						bib, name, elapsed, pos, rawLogId,
+						colorGray, latency, colorReset,
+					)
+				} else {
+					fmt.Printf("%s %s%s✓  OK%s      BIB %-5v  %-20v  elapsed %-10v  pos #%-4v  @ %v  raw#%v  %s[%dms]%s\n",
+						ts(), retryMark, colorBold+colorGreen, colorReset,
+						bib, name, elapsed, pos, cpName, rawLogId,
+						colorGray, latency, colorReset,
+					)
+				}
+			} else {
+				rawLogId, _ := result["raw_log_id"]
+				msg, _      := result["message"].(string)
+				fmt.Printf("%s %s%s✓  QUEUED%s   raw#%v  %s(%s)%s  %s[%dms]%s\n",
+					ts(), retryMark, colorBold+colorGreen, colorReset,
+					rawLogId,
+					colorGray, msg, colorReset,
+					colorGray, latency, colorReset,
+				)
+			}
+		} else {
+			errCode, _ := result["error"].(string)
+			msg, _     := result["message"].(string)
 
-            if isFinish {
-                fmt.Printf("%s %s%s🏁 FINISH!%s  BIB %-5v  %-20v  %v  pos #%v  raw#%v  %s[%dms]%s\n",
-                    ts(), retryMark, colorBold+colorGreen, colorReset,
-                    bib, name, elapsed, pos, rawLogId,
-                    colorGray, latency, colorReset,
-                )
-            } else {
-                fmt.Printf("%s %s%s✓  OK%s      BIB %-5v  %-20v  elapsed %-10v  pos #%-4v  @ %v  raw#%v  %s[%dms]%s\n",
-                    ts(), retryMark, colorBold+colorGreen, colorReset,
-                    bib, name, elapsed, pos, cpName, rawLogId,
-                    colorGray, latency, colorReset,
-                )
-            }
-        } else {
-            // Queue acknowledgement — scan diterima, akan diproses background
-            rawLogId, _ := result["raw_log_id"]
-            msg, _      := result["message"].(string)
-            fmt.Printf("%s %s%s✓  QUEUED%s   raw#%v  %s(%s)%s  %s[%dms]%s\n",
-                ts(), retryMark, colorBold+colorGreen, colorReset,
-                rawLogId,
-                colorGray, msg, colorReset,
-                colorGray, latency, colorReset,
-            )
-        }
+			skipColor := colorGray
+			skipIcon  := "→ "
+			switch errCode {
+			case "already_validated":
+				skipColor = colorCyan
+				skipIcon  = "⊘ "
+			case "rapid_duplicate":
+				skipColor = colorGray
+				skipIcon  = "≈ "
+			case "unknown_rfid":
+				skipColor = colorYellow
+				skipIcon  = "?  "
+			case "past_cutoff":
+				skipColor = colorYellow
+				skipIcon  = "⏰ "
+			case "no_checkpoint_for_category":
+				skipColor = colorRed
+				skipIcon  = "✗  "
+			}
 
-    } else {
-        // Skip normal
-        errCode, _ := result["error"].(string)
-        msg, _     := result["message"].(string)
+			fmt.Printf("%s %s%s%sSKIP%s   %s  %-30s %s(%s)%s  %s[%dms]%s\n",
+				ts(), retryMark,
+				skipColor, skipIcon, colorReset,
+				payload.RfidTag, errCode,
+				colorGray, msg, colorReset,
+				colorGray, latency, colorReset,
+			)
+		}
+		return SendOK
 
-        skipColor := colorGray
-        skipIcon  := "→ "
-        switch errCode {
-        case "already_validated":
-            skipColor = colorCyan
-            skipIcon  = "⊘ "
-        case "rapid_duplicate":
-            skipColor = colorGray
-            skipIcon  = "≈ "
-        case "unknown_rfid":
-            skipColor = colorYellow
-            skipIcon  = "?  "
-        case "past_cutoff":
-            skipColor = colorYellow
-            skipIcon  = "⏰ "
-        case "no_checkpoint_for_category":
-            skipColor = colorRed
-            skipIcon  = "✗  "
-        }
-
-        fmt.Printf("%s %s%s%sSKIP%s   %s  %-30s %s(%s)%s  %s[%dms]%s\n",
-            ts(), retryMark,
-            skipColor, skipIcon, colorReset,
-            payload.RfidTag,
-            errCode,
-            colorGray, msg, colorReset,
-            colorGray, latency, colorReset,
-        )
-    }
-    return SendOK
-	
 	case 401:
 		fmt.Printf("%s %s✗  UNAUTHORIZED%s — device key salah, cek config.json\n",
 			ts(), colorRed, colorReset)
@@ -481,24 +483,19 @@ func drainQueue(queue *RetryQueue, server *ServerState, cfg Config) {
 		}
 
 		result := sendScan(payload, cfg, true)
-
 		switch result {
 		case SendOK:
 			success++
 			if server.IsDown() {
 				server.MarkUp()
 			}
-
 		case SendInvalid:
-			// Data salah, buang saja (tidak perlu retry)
-			fmt.Printf("%s %s↺  DROP%s  %s @ %s (data invalid, dibuang)\n",
+			fmt.Printf("%s %s↺  DROP%s  %s @ %s (data invalid)\n",
 				ts(), colorYellow, colorReset,
 				payload.RfidTag, payload.ScannedAt,
 			)
-			success++ // anggap selesai
-
+			success++
 		default:
-			// Server masih down — kembalikan ke queue dan berhenti
 			queue.Push(payload)
 			fmt.Printf("%s %s↺  DRAIN BERHENTI%s  server masih down, sisa %d item  (berhasil: %d/%d)\n",
 				ts(), colorYellow, colorReset,
@@ -510,13 +507,4 @@ func drainQueue(queue *RetryQueue, server *ServerState, cfg Config) {
 
 	fmt.Printf("%s %s↺  DRAIN SELESAI%s  %d/%d item terkirim\n",
 		ts(), colorGreen, colorReset, success, total)
-}
-
-// ─── TAG EXTRACTION ───────────────────────────────────────────────────────────
-
-func extractTag(raw string) string {
-	if len(raw) < 16 {
-		return ""
-	}
-	return raw[len(raw)-16:]
 }
