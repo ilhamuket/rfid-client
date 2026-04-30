@@ -1,10 +1,11 @@
 {
-  "port": "COM15",
+  "ports": ["COM15", "COM16"],
   "baudrate": 57600,
   "endpoint": "https://scoutrun.id/api/rfid",
   "device_key": "inikeynya",
   "event_id": 1,
   "checkpoint_type": "start",
   "debounce_ms": 3000,
-  "retry_queue_max": 200
+  "retry_queue_max": 200,
+  "debug_raw": true
 }
