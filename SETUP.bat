@@ -112,7 +112,7 @@ if /i "%confirm%"=="n" goto ask_env
 REM ── Tulis config.json ───────────────────────────────────────────────────────
 echo { > config.json
 echo   "port": "%port%", >> config.json
-echo   "baudrate": 115200, >> config.json
+echo   "baudrate": 57600, >> config.json
 echo   "endpoint": "%endpoint%", >> config.json
 echo   "device_key": "%device_key%", >> config.json
 echo   "event_id": %event_id%, >> config.json
