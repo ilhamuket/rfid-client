@@ -4,8 +4,10 @@
   "endpoint": "https://scoutrun.id/api/rfid",
   "device_key": "inikeynya",
   "event_id": 1,
-  "checkpoint_type": "start",
+  "checkpoint_type": "finish",
   "debounce_ms": 3000,
   "retry_queue_max": 200,
-  "debug_raw": true
+  "debug_raw": true,
+  "quit_password": "17200024",
+  "reconnect_ms": 5000
 }

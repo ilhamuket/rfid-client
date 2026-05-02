@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
@@ -8,9 +9,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.bug.st/serial"
@@ -46,6 +49,8 @@ type Config struct {
 	DebounceMs     int      `json:"debounce_ms"`
 	RetryQueueMax  int      `json:"retry_queue_max"`
 	DebugRaw       bool     `json:"debug_raw"`
+	QuitPassword   string   `json:"quit_password"`
+	ReconnectMs    int      `json:"reconnect_ms"`
 }
 
 func (c *Config) GetPorts() []string {
@@ -74,6 +79,12 @@ func loadConfig() Config {
 	}
 	if c.RetryQueueMax == 0 {
 		c.RetryQueueMax = 100
+	}
+	if c.ReconnectMs == 0 {
+		c.ReconnectMs = 5000
+	}
+	if c.QuitPassword == "" {
+		log.Fatal("quit_password wajib diisi di config.json")
 	}
 	validTypes := map[string]bool{"start": true, "finish": true, "checkpoint": true}
 	if !validTypes[c.CheckpointType] {
@@ -170,7 +181,7 @@ func (s *ServerState) StopDrain()       { s.draining.Store(0) }
 type SendResult int
 
 const (
-	SendOK      SendResult = iota
+	SendOK SendResult = iota
 	SendRetry
 	SendFatal
 	SendInvalid
@@ -180,7 +191,7 @@ const (
 
 func main() {
 	cfg := loadConfig()
-	queue  := &RetryQueue{max: cfg.RetryQueueMax}
+	queue := &RetryQueue{max: cfg.RetryQueueMax}
 	server := &ServerState{}
 
 	hostname, _ := os.Hostname()
@@ -193,8 +204,14 @@ func main() {
 	fmt.Printf("  Event ID        : %d\n", cfg.EventID)
 	fmt.Printf("  Endpoint        : %s\n", cfg.Endpoint)
 	fmt.Printf("  Debounce        : %dms\n", cfg.DebounceMs)
-	fmt.Printf("  Queue Max       : %d\n\n", cfg.RetryQueueMax)
+	fmt.Printf("  Queue Max       : %d\n", cfg.RetryQueueMax)
+	fmt.Printf("  Reconnect       : %dms\n", cfg.ReconnectMs)
+	fmt.Printf("  %sCtrl+C dilindungi password%s\n\n", colorYellow, colorReset)
 
+	// Pasang handler password sesegera mungkin (sebelum apa pun yang bisa crash)
+	go handleQuitSignal(cfg.QuitPassword)
+
+	// Drain queue worker
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
@@ -214,32 +231,113 @@ func main() {
 		portName := portName
 		readerID := fmt.Sprintf("%s-%s", hostname, portName)
 
-		mode := &serial.Mode{BaudRate: cfg.BaudRate}
-		port, err := serial.Open(portName, mode)
-		if err != nil {
-			log.Fatalf("Gagal buka port %s: %v", portName, err)
-		}
-		fmt.Printf("%s %s✅ Serial port %s terhubung%s  (Reader: %s)\n",
-			ts(), colorGreen, portName, colorReset, readerID)
-
 		wg.Add(1)
-		go func(p serial.Port, portName, readerID string) {
+		go func() {
 			defer wg.Done()
-			defer p.Close()
-			runReader(p, portName, readerID, cfg, queue, server)
-		}(port, portName, readerID)
+			runReaderWithReconnect(portName, readerID, cfg, queue, server)
+		}()
 	}
 	fmt.Println()
 	wg.Wait()
 }
 
+// ─── QUIT HANDLER ─────────────────────────────────────────────────────────────
+
+func handleQuitSignal(password string) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	var promptMu sync.Mutex // cegah dua prompt password muncul bareng
+
+	for range sigCh {
+		promptMu.Lock()
+		fmt.Printf("\n%s %s🔒 KONFIRMASI KELUAR%s — masukkan password untuk berhenti\n",
+			ts(), colorYellow, colorReset)
+		fmt.Printf("%s %s🔐 Password (atau Enter kosong untuk batal): %s",
+			ts(), colorYellow, colorReset)
+
+		reader := bufio.NewReader(os.Stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			// Kalau stdin tertutup (misal dijalankan tanpa terminal),
+			// jangan auto-exit — tetap jalan.
+			fmt.Printf("%s %s⚠  Stdin tidak tersedia — Ctrl+C diabaikan%s\n",
+				ts(), colorYellow, colorReset)
+			promptMu.Unlock()
+			continue
+		}
+		entered := strings.TrimSpace(line)
+
+		if entered == "" {
+			fmt.Printf("%s %s↩  Dibatalkan — scanner tetap jalan%s\n",
+				ts(), colorCyan, colorReset)
+			promptMu.Unlock()
+			continue
+		}
+
+		if entered == password {
+			fmt.Printf("%s %s✅ Password benar — shutting down...%s\n",
+				ts(), colorGreen, colorReset)
+			os.Exit(0)
+		}
+
+		fmt.Printf("%s %s❌ Password salah — scanner tetap jalan%s\n",
+			ts(), colorRed, colorReset)
+		promptMu.Unlock()
+	}
+}
+
+// ─── READER WITH AUTO-RECONNECT ───────────────────────────────────────────────
+
+func runReaderWithReconnect(portName, readerID string, cfg Config, queue *RetryQueue, server *ServerState) {
+	pColor := portColor(portName)
+	reconnectDelay := time.Duration(cfg.ReconnectMs) * time.Millisecond
+	attempt := 0
+
+	for {
+		mode := &serial.Mode{BaudRate: cfg.BaudRate}
+		port, err := serial.Open(portName, mode)
+		if err != nil {
+			attempt++
+			// Hanya print di attempt pertama dan tiap kelipatan 12 (≈ tiap menit kalau delay 5s)
+			// supaya log gak banjir kalau port lama gak nyambung-nyambung.
+			if attempt == 1 || attempt%12 == 0 {
+				fmt.Printf("%s %s[%s]%s %s⚠  PORT TIDAK TERSEDIA%s (%v) — retry tiap %v... [attempt #%d]\n",
+					ts(), pColor, portName, colorReset,
+					colorYellow, colorReset, err, reconnectDelay, attempt)
+			}
+			time.Sleep(reconnectDelay)
+			continue
+		}
+
+		if attempt > 0 {
+			fmt.Printf("%s %s[%s]%s %s🔄 PORT KEMBALI TERHUBUNG%s setelah %d attempt  (Reader: %s)\n",
+				ts(), pColor, portName, colorReset,
+				colorGreen, colorReset, attempt, readerID)
+		} else {
+			fmt.Printf("%s %s[%s]%s %s✅ Serial port terhubung%s  (Reader: %s)\n",
+				ts(), pColor, portName, colorReset, colorGreen, colorReset, readerID)
+		}
+		attempt = 0
+
+		// Blocking sampai ada read error (port dicabut, dll)
+		runReader(port, portName, readerID, cfg, queue, server)
+		port.Close()
+
+		fmt.Printf("%s %s[%s]%s %s🔌 PORT TERPUTUS%s — reconnect dalam %v...\n",
+			ts(), pColor, portName, colorReset,
+			colorRed, colorReset, reconnectDelay)
+		time.Sleep(reconnectDelay)
+	}
+}
+
 // ─── READER LOOP (PER PORT) ───────────────────────────────────────────────────
 
 func runReader(port serial.Port, portName, readerID string, cfg Config, queue *RetryQueue, server *ServerState) {
-	buf      := make([]byte, 256)
-	var acc  []byte
+	buf := make([]byte, 256)
+	var acc []byte
 	lastSeen := map[string]time.Time{}
-	pColor   := portColor(portName)
+	pColor := portColor(portName)
 	debugRaw := cfg.DebugRaw
 
 	for {
@@ -249,6 +347,8 @@ func runReader(port serial.Port, portName, readerID string, cfg Config, queue *R
 			return
 		}
 		if n == 0 {
+			// Beberapa driver return 0 byte tanpa error kalau port hilang
+			// — kita kasih timeout supaya kedeteksi sebagai disconnect.
 			continue
 		}
 
@@ -348,35 +448,26 @@ func portColor(portName string) string {
 
 type tagMatch struct {
 	tag    string
-	endHex int // posisi akhir dalam string hex (bukan byte)
+	endHex int
 }
 
-// extractAllTags mem-parse EPC dari raw hex stream.
-//
-// Struktur frame reader yang terdeteksi dari RAW dump:
-//   3000 | EPC (12 byte = 24 hex) | TRAILER (12 byte = 24 hex) | 0CCCFFFF | 20051B00 | 3000 | ...
-//
-// Byte setelah EPC (trailer 12 byte) kebetulan dimulai dengan E2 80 --
-// itulah mengapa parser lama mengira ada "tag kedua" (E280691520...).
-// Solusinya: setelah ambil EPC dari posisi "3000", langsung lompat ke
-// "3000" berikutnya -- JANGAN scan karakter per karakter dari posisi +1.
 func extractAllTags(raw string) []tagMatch {
 	seen := map[string]bool{}
 	var result []tagMatch
 
-	marker   := "3000"
-	markerLen := len(marker) // 4
-	epcLen   := 24           // 12 byte EPC = 24 hex chars
-	idx      := 0
+	marker := "3000"
+	markerLen := len(marker)
+	epcLen := 24
+	idx := 0
 
 	for {
 		pos := strings.Index(raw[idx:], marker)
 		if pos < 0 {
 			break
 		}
-		abs      := idx + pos
+		abs := idx + pos
 		epcStart := abs + markerLen
-		epcEnd   := epcStart + epcLen
+		epcEnd := epcStart + epcLen
 		if epcEnd > len(raw) {
 			break
 		}
@@ -385,8 +476,6 @@ func extractAllTags(raw string) []tagMatch {
 			seen[tag] = true
 			result = append(result, tagMatch{tag: tag, endHex: epcEnd})
 		}
-		// Lompat ke SETELAH epcEnd -- skip trailer sehingga tidak ada
-		// kemunculan E280 dari trailer yang ter-parse sebagai EPC baru.
 		idx = epcEnd
 	}
 
@@ -405,8 +494,8 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-DEVICE-KEY", cfg.DeviceKey)
 
-	client  := &http.Client{Timeout: 5 * time.Second}
-	start   := time.Now()
+	client := &http.Client{Timeout: 5 * time.Second}
+	start := time.Now()
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
 
@@ -430,15 +519,15 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 		success, _ := result["success"].(bool)
 		if success {
 			participant, hasParticipant := result["participant"].(map[string]interface{})
-			timing, hasTiming           := result["timing"].(map[string]interface{})
-			checkpoint, _               := result["checkpoint"].(map[string]interface{})
+			timing, hasTiming := result["timing"].(map[string]interface{})
+			checkpoint, _ := result["checkpoint"].(map[string]interface{})
 
 			if hasParticipant && hasTiming {
-				bib, _      := participant["bib"]
-				name, _     := participant["name"]
-				elapsed, _  := timing["elapsed"]
-				pos, _      := timing["position"]
-				cpName, _   := checkpoint["name"]
+				bib, _ := participant["bib"]
+				name, _ := participant["name"]
+				elapsed, _ := timing["elapsed"]
+				pos, _ := timing["position"]
+				cpName, _ := checkpoint["name"]
 				isFinish, _ := result["is_finish"].(bool)
 				rawLogId, _ := result["raw_log_id"]
 
@@ -453,28 +542,33 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 				}
 			} else {
 				rawLogId, _ := result["raw_log_id"]
-				msg, _      := result["message"].(string)
+				msg, _ := result["message"].(string)
 				fmt.Printf("%s %s%s✓  QUEUED%s   raw#%v  %s(%s)%s  %s[%dms]%s\n",
 					ts(), retryMark, colorBold+colorGreen, colorReset,
 					rawLogId, colorGray, msg, colorReset, colorGray, latency, colorReset)
 			}
 		} else {
 			errCode, _ := result["error"].(string)
-			msg, _     := result["message"].(string)
+			msg, _ := result["message"].(string)
 
 			skipColor := colorGray
-			skipIcon  := "→ "
+			skipIcon := "→ "
 			switch errCode {
 			case "already_validated":
-				skipColor = colorCyan;   skipIcon = "⊘ "
+				skipColor = colorCyan
+				skipIcon = "⊘ "
 			case "rapid_duplicate":
-				skipColor = colorGray;   skipIcon = "≈ "
+				skipColor = colorGray
+				skipIcon = "≈ "
 			case "unknown_rfid":
-				skipColor = colorYellow; skipIcon = "?  "
+				skipColor = colorYellow
+				skipIcon = "?  "
 			case "past_cutoff":
-				skipColor = colorYellow; skipIcon = "⏰ "
+				skipColor = colorYellow
+				skipIcon = "⏰ "
 			case "no_checkpoint_for_category":
-				skipColor = colorRed;    skipIcon = "✗  "
+				skipColor = colorRed
+				skipIcon = "✗  "
 			}
 
 			fmt.Printf("%s %s%s%sSKIP%s   %s  %-30s %s(%s)%s  %s[%dms]%s\n",
@@ -505,7 +599,7 @@ func sendScan(payload ScanPayload, cfg Config, isRetry bool) SendResult {
 // ─── DRAIN RETRY QUEUE ────────────────────────────────────────────────────────
 
 func drainQueue(queue *RetryQueue, server *ServerState, cfg Config) {
-	total   := queue.Len()
+	total := queue.Len()
 	success := 0
 
 	fmt.Printf("%s %s↺  DRAIN MULAI%s  %d item dalam queue\n", ts(), colorCyan, colorReset, total)
