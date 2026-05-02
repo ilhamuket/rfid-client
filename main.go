@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -49,7 +50,6 @@ type Config struct {
 	DebounceMs     int      `json:"debounce_ms"`
 	RetryQueueMax  int      `json:"retry_queue_max"`
 	DebugRaw       bool     `json:"debug_raw"`
-	QuitPassword   string   `json:"quit_password"`
 	ReconnectMs    int      `json:"reconnect_ms"`
 }
 
@@ -82,9 +82,6 @@ func loadConfig() Config {
 	}
 	if c.ReconnectMs == 0 {
 		c.ReconnectMs = 5000
-	}
-	if c.QuitPassword == "" {
-		log.Fatal("quit_password wajib diisi di config.json")
 	}
 	validTypes := map[string]bool{"start": true, "finish": true, "checkpoint": true}
 	if !validTypes[c.CheckpointType] {
@@ -197,6 +194,21 @@ func main() {
 	hostname, _ := os.Hostname()
 	ports := cfg.GetPorts()
 
+	// ── FIX 5: Log ke file ───────────────────────────────────────────────────
+	// Semua output log.* (termasuk log.Fatal) ditulis ke stdout + file sekaligus.
+	// Output fmt.Printf tercapture otomatis kalau jalankan via:
+	//   ./rfid-scanner 2>&1 | tee rfid-$(date +%Y%m%d_%H%M%S).log
+	logFileName := fmt.Sprintf("rfid-%s.log", time.Now().Format("2006-01-02_15-04-05"))
+	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Printf("⚠  Tidak bisa buat log file: %v — lanjut tanpa file log\n", err)
+	} else {
+		log.SetOutput(io.MultiWriter(os.Stderr, logFile))
+		defer logFile.Close()
+		fmt.Printf("📝 Log file: %s\n", logFileName)
+	}
+	// ─────────────────────────────────────────────────────────────────────────
+
 	fmt.Printf("\n%s%s=== RFID RACE SCANNER (MULTI-PORT) ===%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("  Hostname        : %s\n", hostname)
 	fmt.Printf("  Ports           : %s\n", strings.Join(ports, ", "))
@@ -206,15 +218,14 @@ func main() {
 	fmt.Printf("  Debounce        : %dms\n", cfg.DebounceMs)
 	fmt.Printf("  Queue Max       : %d\n", cfg.RetryQueueMax)
 	fmt.Printf("  Reconnect       : %dms\n", cfg.ReconnectMs)
-	fmt.Printf("  %sCtrl+C dilindungi password%s\n\n", colorYellow, colorReset)
+	fmt.Printf("  %sCtrl+C minta konfirmasi Y/N%s\n\n", colorYellow, colorReset)
 
-	// Pasang handler password sesegera mungkin (sebelum apa pun yang bisa crash)
-	go handleQuitSignal(cfg.QuitPassword)
+	go handleQuitSignal()
 
-	// Drain queue worker
+	// ── FIX 2: Drain interval 10s → 2s ──────────────────────────────────────
 	go func() {
 		for {
-			time.Sleep(10 * time.Second)
+			time.Sleep(2 * time.Second)
 			if queue.Len() == 0 {
 				continue
 			}
@@ -241,48 +252,37 @@ func main() {
 	wg.Wait()
 }
 
-// ─── QUIT HANDLER ─────────────────────────────────────────────────────────────
+// ─── QUIT HANDLER (konfirmasi Y/N, tanpa password) ────────────────────────────
 
-func handleQuitSignal(password string) {
+func handleQuitSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	var promptMu sync.Mutex // cegah dua prompt password muncul bareng
+	var promptMu sync.Mutex
 
 	for range sigCh {
 		promptMu.Lock()
-		fmt.Printf("\n%s %s🔒 KONFIRMASI KELUAR%s — masukkan password untuk berhenti\n",
-			ts(), colorYellow, colorReset)
-		fmt.Printf("%s %s🔐 Password (atau Enter kosong untuk batal): %s",
+		fmt.Printf("\n%s %s🔒 Mau keluar? Ketik 'y' lalu Enter untuk berhenti, Enter kosong untuk batal: %s",
 			ts(), colorYellow, colorReset)
 
 		reader := bufio.NewReader(os.Stdin)
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			// Kalau stdin tertutup (misal dijalankan tanpa terminal),
-			// jangan auto-exit — tetap jalan.
 			fmt.Printf("%s %s⚠  Stdin tidak tersedia — Ctrl+C diabaikan%s\n",
 				ts(), colorYellow, colorReset)
 			promptMu.Unlock()
 			continue
 		}
-		entered := strings.TrimSpace(line)
+		entered := strings.TrimSpace(strings.ToLower(line))
 
-		if entered == "" {
-			fmt.Printf("%s %s↩  Dibatalkan — scanner tetap jalan%s\n",
-				ts(), colorCyan, colorReset)
-			promptMu.Unlock()
-			continue
-		}
-
-		if entered == password {
-			fmt.Printf("%s %s✅ Password benar — shutting down...%s\n",
+		if entered == "y" || entered == "yes" {
+			fmt.Printf("%s %s✅ Konfirmasi diterima — shutting down...%s\n",
 				ts(), colorGreen, colorReset)
 			os.Exit(0)
 		}
 
-		fmt.Printf("%s %s❌ Password salah — scanner tetap jalan%s\n",
-			ts(), colorRed, colorReset)
+		fmt.Printf("%s %s↩  Dibatalkan — scanner tetap jalan%s\n",
+			ts(), colorCyan, colorReset)
 		promptMu.Unlock()
 	}
 }
@@ -295,12 +295,12 @@ func runReaderWithReconnect(portName, readerID string, cfg Config, queue *RetryQ
 	attempt := 0
 
 	for {
-		mode := &serial.Mode{BaudRate: cfg.BaudRate}
+		mode := &serial.Mode{
+			BaudRate: cfg.BaudRate,
+		}
 		port, err := serial.Open(portName, mode)
 		if err != nil {
 			attempt++
-			// Hanya print di attempt pertama dan tiap kelipatan 12 (≈ tiap menit kalau delay 5s)
-			// supaya log gak banjir kalau port lama gak nyambung-nyambung.
 			if attempt == 1 || attempt%12 == 0 {
 				fmt.Printf("%s %s[%s]%s %s⚠  PORT TIDAK TERSEDIA%s (%v) — retry tiap %v... [attempt #%d]\n",
 					ts(), pColor, portName, colorReset,
@@ -309,6 +309,9 @@ func runReaderWithReconnect(portName, readerID string, cfg Config, queue *RetryQ
 			time.Sleep(reconnectDelay)
 			continue
 		}
+
+		// ReadTimeout wajib di-set via method, bukan field Mode
+		port.SetReadTimeout(3 * time.Second)
 
 		if attempt > 0 {
 			fmt.Printf("%s %s[%s]%s %s🔄 PORT KEMBALI TERHUBUNG%s setelah %d attempt  (Reader: %s)\n",
@@ -320,7 +323,6 @@ func runReaderWithReconnect(portName, readerID string, cfg Config, queue *RetryQ
 		}
 		attempt = 0
 
-		// Blocking sampai ada read error (port dicabut, dll)
 		runReader(port, portName, readerID, cfg, queue, server)
 		port.Close()
 
@@ -339,16 +341,61 @@ func runReader(port serial.Port, portName, readerID string, cfg Config, queue *R
 	lastSeen := map[string]time.Time{}
 	pColor := portColor(portName)
 	debugRaw := cfg.DebugRaw
+	debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
+
+	// ── FIX 1: Bersihkan lastSeen tiap 5 menit ──────────────────────────────
+	// Goroutine ini safe tanpa mutex karena lastSeen hanya diakses dari
+	// goroutine runReader ini saja — tidak ada goroutine lain yang menyentuhnya.
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			now := time.Now()
+			before := len(lastSeen)
+			for tag, t := range lastSeen {
+				if now.Sub(t) > debounce*2 {
+					delete(lastSeen, tag)
+				}
+			}
+			after := len(lastSeen)
+			if before != after {
+				fmt.Printf("%s %s[%s]%s %s🧹 lastSeen cleanup%s: %d → %d entry\n",
+					ts(), pColor, portName, colorReset, colorGray, colorReset, before, after)
+			}
+		}
+	}()
+	// ─────────────────────────────────────────────────────────────────────────
+
+	// Watchdog — deteksi Read() hang
+	var lastReadAt atomic.Int64
+	lastReadAt.Store(time.Now().UnixNano())
+
+	go func() {
+		const watchdogInterval = 5 * time.Second
+		const hangThreshold = 10 * time.Second
+		for {
+			time.Sleep(watchdogInterval)
+			since := time.Since(time.Unix(0, lastReadAt.Load()))
+			if since > hangThreshold {
+				fmt.Printf("%s %s[%s]%s %s⚠  WATCHDOG: Read() hang selama %v — force reconnect%s\n",
+					ts(), pColor, portName, colorReset,
+					colorRed, since.Round(time.Second), colorReset)
+				port.Close()
+				return
+			}
+		}
+	}()
 
 	for {
 		n, err := port.Read(buf)
+		lastReadAt.Store(time.Now().UnixNano())
+
 		if err != nil {
 			log.Printf("[%s] Read error: %v", portName, err)
 			return
 		}
+
 		if n == 0 {
-			// Beberapa driver return 0 byte tanpa error kalau port hilang
-			// — kita kasih timeout supaya kedeteksi sebagai disconnect.
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -372,7 +419,6 @@ func runReader(port serial.Port, portName, readerID string, cfg Config, queue *R
 			continue
 		}
 
-		// Trim acc sampai setelah byte tag terakhir yang valid
 		lastEndByte := matches[len(matches)-1].endHex / 2
 		if lastEndByte >= len(acc) {
 			acc = nil
@@ -385,7 +431,6 @@ func runReader(port serial.Port, portName, readerID string, cfg Config, queue *R
 			fmt.Printf("%s %s[%s]%s %sdebug: tag → %s%s\n",
 				ts(), pColor, portName, colorReset, colorGray, rfidTag, colorReset)
 
-			debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
 			if t, ok := lastSeen[rfidTag]; ok {
 				if time.Since(t) < debounce {
 					fmt.Printf("%s %s[%s]%s %s≈  DEBOUNCE%s  %s  (%.0fms)\n",
@@ -616,6 +661,10 @@ func drainQueue(queue *RetryQueue, server *ServerState, cfg Config) {
 			if server.IsDown() {
 				server.MarkUp()
 			}
+			// ── FIX 3: Throttle drain 50ms ──────────────────────────────────
+			// Cegah burst 200 request sekaligus saat server baru up.
+			time.Sleep(50 * time.Millisecond)
+			// ─────────────────────────────────────────────────────────────────
 		case SendInvalid:
 			fmt.Printf("%s %s↺  DROP%s  %s @ %s (data invalid)\n",
 				ts(), colorYellow, colorReset, payload.RfidTag, payload.ScannedAt)
